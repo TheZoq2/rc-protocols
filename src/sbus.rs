@@ -9,7 +9,8 @@ const CHANNEL_BYTE_COUNT: usize = 22;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
-    MissingStopByte
+    MissingStopByte,
+    Failsafe
 }
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -82,7 +83,13 @@ impl<'a, E> SbusDecoder<'a, E> {
                 }
                 DecoderState::WaitForFooter => {
                     if byte == FOOTER_BYTE {
-                        self.result_tx.enqueue(Ok(self.current_message.clone()));
+                        if !self.current_message.failsafe {
+                            self.result_tx.enqueue(Ok(self.current_message.clone()));
+                        }
+                        else {
+                            self.result_tx.enqueue(Err(Error::Failsafe));
+                        }
+
                         DecoderState::WaitForHeader
                     }
                     else {
@@ -339,5 +346,54 @@ mod tests {
                    .expect("Expected message not to be Err")
                 , expected
             );
+    }
+
+    #[test]
+    fn sbus_decoder_detects_failsafes() {
+        let mut byte_queue = Queue::new();
+        let (mut byte_producer, byte_consumer) = byte_queue.split();
+
+        let mut message_queue = Queue::new();
+        let (message_producer, mut message_consumer) = message_queue.split();
+        let mut decoder = SbusDecoder::<()>::new(byte_consumer, message_producer);
+
+        // Alternating max value, min value for each channel.
+        // Bool channels == 1, failsafe == 0
+        let bytes: [u8; 25] = [
+            0x0f,
+            0b1111_1110,
+            0b0000_0111,
+            0b1100_0000,
+            0b1111_1111,
+            0b0000_0001,
+            0b1111_0000,
+            0b0111_1111,
+            0b0000_0000,
+            0b1111_1100,
+            0b0001_1111,
+            0b0000_0000,
+            0b1111_1111,
+            0b0000_0111,
+            0b1100_0000,
+            0b1111_1111,
+            0b0000_0001,
+            0b1111_0000,
+            0b0111_1111,
+            0b0000_0000,
+            0b1111_1100,
+            0b0001_1111,
+            0b0000_0000,
+            0b0000_0111,
+            0b0000_0000
+        ];
+
+        for byte in &bytes {
+            byte_producer.enqueue(Ok(*byte)).unwrap();
+        }
+
+        decoder.process();
+
+        let decoded = message_consumer.dequeue();
+        assert_eq!(decoded, Some(Err(Error::Failsafe)));
     }
 }
