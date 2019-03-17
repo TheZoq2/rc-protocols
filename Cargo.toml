@@ -1,0 +1,10 @@
+[package]
+name = "decoders"
+version = "0.1.0"
+authors = ["TheZoq2 <frans.skarman@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+heapless = "0.4.2"
+embedded-hal = "0.2.2"
+pretty_assertions = "0.6.1"
