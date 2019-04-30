@@ -2,6 +2,7 @@
 
 pub mod sbus;
 pub mod cppm;
+pub mod smart_port;
 
 #[cfg(test)]
 mod tests {

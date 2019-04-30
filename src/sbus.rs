@@ -10,7 +10,9 @@ const CHANNEL_BYTE_COUNT: usize = 22;
 #[derive(Debug, PartialEq)]
 pub enum Error {
     MissingStopByte,
-    Failsafe
+    Failsafe,
+    VecFull(u8),
+    ResultTxFull,
 }
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -51,12 +53,30 @@ impl<'a, E> SbusDecoder<'a, E> {
         }
     }
 
-    pub fn process(&mut self) {
+    /**
+      Process the bytes that have been sent over the byte channel. If a full frame
+      has been received, or some bytes were invalid, the frame or error are sent
+      over the message channel.
+
+      If the message can't be sent over the message channel, an error is returned.
+    */
+    pub fn process(&mut self) -> Result<()> {
         loop {
-            let mut _count = 0;
+            // Dequeue the next byte. If no byte is in the queue, exit.
+            //
+            // If the next byte is valid, continue parsing
+            //
+            // If an error was received from the byte sender, go into recovery
+            // and continue parsing the next byte
             let byte = match self.byte_rx.dequeue() {
-                Some(byte) => byte.unwrap_or(0), // TODO: Handle this error
-                None => break
+                Some(byte) => match byte {
+                    Ok(byte) => byte,
+                    Err(_) => {
+                        self.state = DecoderState::Recover;
+                        continue
+                    }
+                },
+                None => break Ok(())
             };
 
             let new_state = match self.state.clone() {
@@ -65,12 +85,18 @@ impl<'a, E> SbusDecoder<'a, E> {
                         DecoderState::Channel(Vec::default())
                     }
                     else {
+                        // We expected a header byte but it did not arrive, go into
+                        // recovery mode
                         DecoderState::Recover
                     }
                 }
                 DecoderState::Channel(mut previous_bytes) => {
                     if previous_bytes.len() < CHANNEL_BYTE_COUNT {
-                        previous_bytes.push(byte);
+                        // We are still expecting more bytes with channel values,
+                        // try to decode and store them.
+                        if let Err(byte) = previous_bytes.push(byte) {
+                            break Err(Error::VecFull(byte))
+                        }
                         DecoderState::Channel(previous_bytes)
                     }
                     else {
@@ -83,21 +109,39 @@ impl<'a, E> SbusDecoder<'a, E> {
                 }
                 DecoderState::WaitForFooter => {
                     if byte == FOOTER_BYTE {
+                        // We received a footer byte, decode the data
                         if !self.current_message.failsafe {
-                            self.result_tx.enqueue(Ok(self.current_message.clone()));
+                            // We did not failsafe, send the resulting message.
+                            let enqueue_result = self.result_tx.enqueue(
+                                Ok(self.current_message.clone())
+                            );
+                            if let Err(_) = enqueue_result {
+                                break Err(Error::ResultTxFull)
+                            }
                         }
                         else {
-                            self.result_tx.enqueue(Err(Error::Failsafe));
+                            // We failsafed, try to send that message
+                            let enqueue_result = self.result_tx.enqueue(Err(Error::Failsafe));
+                            if let Err(_) = enqueue_result {
+                                break Err(Error::ResultTxFull)
+                            }
                         }
 
+                        // Wait for the next frame
                         DecoderState::WaitForHeader
                     }
                     else {
-                        self.result_tx.enqueue(Err(Error::MissingStopByte));
+                        // We did not get a stop byte, try to relay that error
+                        let enqueue_result = self.result_tx.enqueue(Err(Error::MissingStopByte));
+                        if let Err(_) = enqueue_result {
+                            break Err(Error::ResultTxFull)
+                        }
                         DecoderState::Recover
                     }
                 }
                 DecoderState::Recover => {
+                    // We need to see a sequence of FOOTER->HEADER to know that
+                    // we are in a valid state
                     if byte == FOOTER_BYTE {
                         DecoderState::WaitForHeader
                     }
@@ -107,6 +151,7 @@ impl<'a, E> SbusDecoder<'a, E> {
                 }
             };
 
+            // Update the state
             self.state = new_state;
         }
     }
@@ -218,7 +263,7 @@ mod tests {
             byte_producer.enqueue(Ok(*byte)).unwrap();
         }
 
-        decoder.process();
+        decoder.process().unwrap();
 
         let decoded = message_consumer.dequeue();
 
@@ -265,7 +310,7 @@ mod tests {
             byte_producer.enqueue(Ok(0x01)).expect("Failed to enqueue byte");
         }
 
-        decoder.process();
+        decoder.process().unwrap();
 
         let decoded = message_consumer.dequeue();
         assert_eq!(decoded, Some(Err(Error::MissingStopByte)));
@@ -278,7 +323,7 @@ mod tests {
         // Enqueue a simulated stop byte
         byte_producer.enqueue(Ok(0)).expect("failed to enqueue simulated stop byte");
 
-        decoder.process();
+        decoder.process().unwrap();
 
         // Enqueue a full valid message
 
@@ -315,7 +360,7 @@ mod tests {
             byte_producer.enqueue(Ok(*byte)).unwrap();
         }
 
-        decoder.process();
+        decoder.process().unwrap();
 
         let decoded = message_consumer.dequeue();
 
@@ -391,7 +436,7 @@ mod tests {
             byte_producer.enqueue(Ok(*byte)).unwrap();
         }
 
-        decoder.process();
+        decoder.process().unwrap();
 
         let decoded = message_consumer.dequeue();
         assert_eq!(decoded, Some(Err(Error::Failsafe)));
