@@ -81,78 +81,95 @@ impl<'a, E> SbusDecoder<'a, E> {
 
             let new_state = match self.state.clone() {
                 DecoderState::WaitForHeader => {
-                    if byte == HEADER_BYTE {
-                        DecoderState::Channel(Vec::default())
-                    }
-                    else {
-                        // We expected a header byte but it did not arrive, go into
-                        // recovery mode
-                        DecoderState::Recover
-                    }
+                    self.wait_for_header(byte)
                 }
-                DecoderState::Channel(mut previous_bytes) => {
-                    if previous_bytes.len() < CHANNEL_BYTE_COUNT {
-                        // We are still expecting more bytes with channel values,
-                        // try to decode and store them.
-                        if let Err(byte) = previous_bytes.push(byte) {
-                            break Err(Error::VecFull(byte))
-                        }
-                        DecoderState::Channel(previous_bytes)
-                    }
-                    else {
-                        // This was the last channel byte, decode channels
-                        // and add the digital channels
-                        decode_channels(&mut self.current_message, previous_bytes);
-                        decode_digital_byte(&mut self.current_message, byte);
-                        DecoderState::WaitForFooter
-                    }
+                DecoderState::Channel(previous_bytes) => {
+                    self.channel_state(byte, previous_bytes)?
                 }
                 DecoderState::WaitForFooter => {
-                    if byte == FOOTER_BYTE {
-                        // We received a footer byte, decode the data
-                        if !self.current_message.failsafe {
-                            // We did not failsafe, send the resulting message.
-                            let enqueue_result = self.result_tx.enqueue(
-                                Ok(self.current_message.clone())
-                            );
-                            if let Err(_) = enqueue_result {
-                                break Err(Error::ResultTxFull)
-                            }
-                        }
-                        else {
-                            // We failsafed, try to send that message
-                            let enqueue_result = self.result_tx.enqueue(Err(Error::Failsafe));
-                            if let Err(_) = enqueue_result {
-                                break Err(Error::ResultTxFull)
-                            }
-                        }
-
-                        // Wait for the next frame
-                        DecoderState::WaitForHeader
-                    }
-                    else {
-                        // We did not get a stop byte, try to relay that error
-                        let enqueue_result = self.result_tx.enqueue(Err(Error::MissingStopByte));
-                        if let Err(_) = enqueue_result {
-                            break Err(Error::ResultTxFull)
-                        }
-                        DecoderState::Recover
-                    }
+                    self.wait_for_footer_state(byte)?
                 }
                 DecoderState::Recover => {
-                    // We need to see a sequence of FOOTER->HEADER to know that
-                    // we are in a valid state
-                    if byte == FOOTER_BYTE {
-                        DecoderState::WaitForHeader
-                    }
-                    else {
-                        DecoderState::Recover
-                    }
+                    self.recover_state(byte)
                 }
             };
 
             // Update the state
             self.state = new_state;
+        }
+    }
+
+    // Handle bytes being received in the recover state
+    fn recover_state(&mut self, byte: u8) -> DecoderState {
+        // We need to see a sequence of FOOTER->HEADER to know that
+        // we are in a valid state
+        if byte == FOOTER_BYTE {
+            DecoderState::WaitForHeader
+        }
+        else {
+            DecoderState::Recover
+        }
+    }
+
+    fn wait_for_footer_state(&mut self, byte: u8) -> Result<DecoderState> {
+        if byte == FOOTER_BYTE {
+            // We received a footer byte, decode the data
+            if !self.current_message.failsafe {
+                // We did not failsafe, send the resulting message.
+                let enqueue_result = self.result_tx.enqueue(Ok(self.current_message.clone()));
+                if let Err(_) = enqueue_result {
+                    return Err(Error::ResultTxFull)
+                }
+            }
+            else {
+                // We failsafed, try to send that message
+                let enqueue_result = self.result_tx.enqueue(Err(Error::Failsafe));
+                if let Err(_) = enqueue_result {
+                    return Err(Error::ResultTxFull)
+                }
+            }
+
+            // Wait for the next frame
+            Ok(DecoderState::WaitForHeader)
+        }
+        else {
+            // We did not get a stop byte, try to relay that error
+            let enqueue_result = self.result_tx.enqueue(Err(Error::MissingStopByte));
+            if let Err(_) = enqueue_result {
+                return Err(Error::ResultTxFull)
+            }
+            Ok(DecoderState::Recover)
+        }
+    }
+
+    fn channel_state(&mut self, byte: u8, mut previous_bytes: Vec<u8, U22>)
+        -> Result<DecoderState>
+    {
+        if previous_bytes.len() < CHANNEL_BYTE_COUNT {
+            // We are still expecting more bytes with channel values,
+            // try to decode and store them.
+            if let Err(byte) = previous_bytes.push(byte) {
+                return Err(Error::VecFull(byte))
+            }
+            Ok(DecoderState::Channel(previous_bytes))
+        }
+        else {
+            // This was the last channel byte, decode channels
+            // and add the digital channels
+            decode_channels(&mut self.current_message, previous_bytes);
+            decode_digital_byte(&mut self.current_message, byte);
+            Ok(DecoderState::WaitForFooter)
+        }
+    }
+
+    fn wait_for_header(&mut self, byte: u8) -> DecoderState {
+        if byte == HEADER_BYTE {
+            DecoderState::Channel(Vec::default())
+        }
+        else {
+            // We expected a header byte but it did not arrive, go into
+            // recovery mode
+            DecoderState::Recover
         }
     }
 }
