@@ -46,8 +46,6 @@ pub struct SbusDecoder<'a, E: Clone> {
     byte_rx: Consumer<'a, core::result::Result<u8, E>, U25>,
     result_tx: Producer<'a, RecoverableResult<SbusFrame, E>, U1>,
     state: DecoderState,
-    current_message: SbusFrame,
-    failsafe: bool
 }
 
 impl<'a, E: Clone> SbusDecoder<'a, E> {
@@ -59,8 +57,6 @@ impl<'a, E: Clone> SbusDecoder<'a, E> {
             byte_rx,
             result_tx,
             state: DecoderState::WaitForHeader,
-            current_message: Default::default(),
-            failsafe: false
         }
     }
 
@@ -71,7 +67,7 @@ impl<'a, E: Clone> SbusDecoder<'a, E> {
 
       If the message can't be sent over the message channel, an error is returned.
     */
-    pub fn process(&mut self) -> ProcessingResult<(), E> {
+    pub fn process(&mut self) -> ProcessingResult<DecoderState, E> {
         loop {
             // Dequeue the next byte. If no byte is in the queue, exit.
             //
@@ -88,7 +84,7 @@ impl<'a, E: Clone> SbusDecoder<'a, E> {
                         continue
                     }
                 },
-                None => break Ok(())
+                None => break Ok(self.state.clone())
             };
 
             let new_state = match self.state.clone() {
@@ -98,8 +94,8 @@ impl<'a, E: Clone> SbusDecoder<'a, E> {
                 DecoderState::Channel(previous_bytes) => {
                     self.channel_state(byte, previous_bytes)?
                 }
-                DecoderState::WaitForFooter => {
-                    self.wait_for_footer_state(byte)?
+                DecoderState::WaitForFooter(result) => {
+                    self.wait_for_footer_state(byte, result)?
                 }
                 DecoderState::Recover => {
                     self.recover_state(byte)
@@ -123,19 +119,17 @@ impl<'a, E: Clone> SbusDecoder<'a, E> {
         }
     }
 
-    fn wait_for_footer_state(&mut self, byte: u8) -> ProcessingResult<DecoderState, E> {
+    fn wait_for_footer_state(
+        &mut self,
+        byte: u8,
+        frame: Result<SbusFrame, Failsafe>
+    ) -> ProcessingResult<DecoderState, E> {
         if byte == FOOTER_BYTE {
-            // We received a footer byte, decode the data
-            if !self.failsafe {
-                // We did not failsafe, send the resulting message.
-                self.try_send_message(Ok(self.current_message.clone()))?
-            }
-            else {
-                // We failsafed, try to send that message
-                let to_send = Err(Error::Failsafe(self.current_message.clone()));
-                self.failsafe = false;
-                self.try_send_message(to_send)?;
-            }
+            let result = match frame {
+                Ok(frame) => Ok(frame),
+                Err(Failsafe{frame}) => Err(Error::Failsafe(frame)),
+            };
+            self.try_send_message(result)?;
 
             // Wait for the next frame
             Ok(DecoderState::WaitForHeader)
@@ -147,27 +141,20 @@ impl<'a, E: Clone> SbusDecoder<'a, E> {
         }
     }
 
-    fn channel_state(&mut self, byte: u8, mut previous_bytes: Vec<u8, U22>)
+    fn channel_state(&mut self, byte: u8, mut previous_bytes: Vec<u8, U23>)
         -> ProcessingResult<DecoderState, E>
     {
         if previous_bytes.len() < CHANNEL_BYTE_COUNT {
+            self.try_push_byte(byte, &mut previous_bytes)?;
             // We are still expecting more bytes with channel values,
             // try to decode and store them.
-            if let Err(byte) = previous_bytes.push(byte) {
-                self.state = DecoderState::Recover;
-                return Err(FatalError::VecFull(byte))
-            }
             Ok(DecoderState::Channel(previous_bytes))
         }
         else {
+            self.try_push_byte(byte, &mut previous_bytes)?;
             // This was the last channel byte, decode channels
-            // and add the digital channels
-            decode_channels(&mut self.current_message, previous_bytes);
-            if let Err(Failsafe) = decode_digital_byte(&mut self.current_message, byte) {
-                self.failsafe = true;
-            }
-
-            Ok(DecoderState::WaitForFooter)
+            // and wait for footer
+            Ok(DecoderState::WaitForFooter(decode_sbus(previous_bytes)))
         }
     }
 
@@ -194,25 +181,36 @@ impl<'a, E: Clone> SbusDecoder<'a, E> {
             Ok(())
         }
     }
+    fn try_push_byte<S>(&mut self, byte: u8, target: &mut Vec<u8, S>)
+        -> ProcessingResult<(), E>
+        where S: heapless::ArrayLength<u8>
+    {
+        if let Err(byte) = target.push(byte) {
+            self.state = DecoderState::Recover;
+            Err(FatalError::VecFull(byte))
+        }
+        else {
+            Ok(())
+        }
+    }
 }
 
-#[derive(Clone)]
-enum DecoderState {
+#[derive(Clone, Debug)]
+pub struct Failsafe{frame: SbusFrame}
+
+#[derive(Clone, Debug)]
+pub enum DecoderState {
     WaitForHeader,
-    /// Waiting for the specified channel. The second element is the amount of
-    /// bytes already consumed. The last element is the partial
-    /// channel that has already been decoded
-    Channel(Vec<u8, U22>),
+    /// Waiting for the specified channel. Keeps track of the bytes that
+    /// have been received so far
+    Channel(Vec<u8, U23>),
     /// Waiting for the last byte containing digital channels and failsafe
-    WaitForFooter,
+    WaitForFooter(Result<SbusFrame, Failsafe>),
     Recover
 }
 
-struct Failsafe;
-
-
-// TODO: This could be merged and immutable
-fn decode_channels(message: &mut SbusFrame, bytes: Vec<u8, U22>) {
+fn decode_sbus(bytes: Vec<u8, U23>) -> core::result::Result<SbusFrame, Failsafe> {
+    let mut message = SbusFrame::default();
     for channel in 0..CHANNEL_AMOUNT {
         let offset = channel * 11;
         let first_byte_offset = offset % 8;
@@ -246,15 +244,14 @@ fn decode_channels(message: &mut SbusFrame, bytes: Vec<u8, U22>) {
             | from_second_byte
             | from_third_byte
     }
-}
-fn decode_digital_byte(message: &mut SbusFrame, byte: u8) -> Result<(), Failsafe> {
-    message.digital_channels[0] = (byte & 0b001) != 0;
-    message.digital_channels[1] = (byte & 0b010) != 0;
-    if (byte & 0b100) != 0 {
-        Err(Failsafe{})
+    let digital_byte = bytes[22];
+    message.digital_channels[0] = (digital_byte & 0b001) != 0;
+    message.digital_channels[1] = (digital_byte & 0b010) != 0;
+    if (digital_byte & 0b100) != 0 {
+        Err(Failsafe{frame: message})
     }
     else {
-        Ok(())
+        Ok(message)
     }
 }
 
@@ -262,6 +259,7 @@ fn decode_digital_byte(message: &mut SbusFrame, byte: u8) -> Result<(), Failsafe
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use pretty_assertions::{assert_eq};
     use super::*;
 
@@ -310,7 +308,8 @@ mod tests {
             byte_producer.enqueue(Ok(*byte)).unwrap();
         }
 
-        decoder.process().unwrap();
+        let result = decoder.process().expect("Decode error");
+        assert_matches!(result, DecoderState::WaitForHeader);
 
         let decoded = message_consumer.dequeue();
 
