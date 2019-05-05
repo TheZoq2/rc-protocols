@@ -43,14 +43,14 @@ impl Default for SbusFrame {
 }
 
 pub struct SbusDecoder<'a, E> {
-    byte_rx: Consumer<'a, core::result::Result<u8, E>, U25>,
+    byte_rx: Consumer<'a, core::result::Result<u8, E>, U32>,
     result_tx: Producer<'a, RecoverableResult<SbusFrame, E>, U8>,
     state: DecoderState,
 }
 
 impl<'a, E> SbusDecoder<'a, E> {
     pub fn new(
-        byte_rx: Consumer<'a, core::result::Result<u8, E>, U25>,
+        byte_rx: Consumer<'a, core::result::Result<u8, E>, U32>,
         result_tx: Producer<'a, RecoverableResult<SbusFrame, E>, U8>
     ) -> Self {
         Self {
