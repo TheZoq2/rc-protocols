@@ -7,8 +7,8 @@ const FOOTER_BYTE: u8 = 0x00;
 const CHANNEL_AMOUNT: u8 = 16;
 const CHANNEL_BYTE_COUNT: usize = 22;
 
-#[derive(Debug, PartialEq, Clone)]
-pub enum Error<E: Clone> {
+#[derive(Debug, PartialEq)]
+pub enum Error<E> {
     MissingFooter,
     Failsafe(SbusFrame),
     MissingHeader,
@@ -27,7 +27,7 @@ pub struct SbusFrame {
 }
 
 #[derive(Debug)]
-pub enum FatalError<E: Clone> {
+pub enum FatalError<E> {
     ResultTxFull(RecoverableResult<SbusFrame, E>),
     VecFull(u8),
 }
@@ -42,16 +42,16 @@ impl Default for SbusFrame {
     }
 }
 
-pub struct SbusDecoder<'a, E: Clone> {
+pub struct SbusDecoder<'a, E> {
     byte_rx: Consumer<'a, core::result::Result<u8, E>, U25>,
-    result_tx: Producer<'a, RecoverableResult<SbusFrame, E>, U1>,
+    result_tx: Producer<'a, RecoverableResult<SbusFrame, E>, U8>,
     state: DecoderState,
 }
 
-impl<'a, E: Clone> SbusDecoder<'a, E> {
+impl<'a, E> SbusDecoder<'a, E> {
     pub fn new(
         byte_rx: Consumer<'a, core::result::Result<u8, E>, U25>,
-        result_tx: Producer<'a, RecoverableResult<SbusFrame, E>, U1>
+        result_tx: Producer<'a, RecoverableResult<SbusFrame, E>, U8>
     ) -> Self {
         Self {
             byte_rx,
@@ -173,7 +173,7 @@ impl<'a, E: Clone> SbusDecoder<'a, E> {
     fn try_send_message(&mut self, message: RecoverableResult<SbusFrame, E>)
         -> ProcessingResult<(), E>
     {
-        if let Err(_) = self.result_tx.enqueue(message.clone()) {
+        if let Err(message) = self.result_tx.enqueue(message) {
             self.state = DecoderState::Recover;
             Err(FatalError::ResultTxFull(message))
         }
