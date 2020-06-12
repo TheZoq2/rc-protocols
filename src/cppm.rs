@@ -1,4 +1,4 @@
-use embedded_hal::{digital::OutputPin, timer::CountDown};
+use embedded_hal::{digital::v2::OutputPin, timer::CountDown};
 use core::marker::PhantomData;
 
 // All timings are expressed in microseconds
@@ -73,16 +73,16 @@ where
         mut pin: PIN,
         initial_frame: PpmFrame<TIMER::Time>,
         time_300us: TIMER::Time
-    ) -> Self {
-        pin.set_high();
+    ) -> Result<Self, PIN::Error> {
+        pin.set_high()?;
 
-        Self {
+        Ok(Self {
             pin,
             index: 0,
             is_low: false,
             current_frame: initial_frame,
             time_300us
-        }
+        })
     }
 
     /// Timer event handler.
@@ -90,9 +90,9 @@ where
         &mut self,
         timer: &mut TIMER,
         next_frame: &PpmFrame<TIMER::Time>
-    ) {
+    ) -> Result<(), PIN::Error> {
         if self.is_low {
-            self.pin.set_high();
+            self.pin.set_high()?;
             if self.index == CHANNEL_COUNT {
                 timer.start(self.current_frame.frame_padding);
 
@@ -108,8 +108,9 @@ where
         }
         else {
             timer.start(self.time_300us);
-            self.pin.set_low();
+            self.pin.set_low()?;
             self.is_low = true;
         }
+        Ok(())
     }
 }
